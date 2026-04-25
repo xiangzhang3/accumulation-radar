@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+"""庄家收筹雷达 — OKX 数据源版本"""
 import os, sys, time, sqlite3, requests
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -6,7 +7,7 @@ from pathlib import Path
 FEISHU_WEBHOOK = os.getenv("FEISHU_WEBHOOK", "")
 TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "")
 TG_CHAT_ID = os.getenv("TG_CHAT_ID", "")
-FAPI = "https://fapi.binance.com"
+OKX = "https://www.okx.com"
 DB_PATH = Path(__file__).parent / "accumulation.db"
 
 MIN_SIDEWAYS_DAYS = 45
@@ -15,27 +16,25 @@ MAX_AVG_VOL_USD = 20_000_000
 MIN_DATA_DAYS = 50
 
 
-def api_get(endpoint, params=None):
-    url = f"{FAPI}{endpoint}"
+def okx_get(endpoint, params=None):
+    url = f"{OKX}{endpoint}"
     last_err = None
-    for attempt in range(3):
+    for _ in range(3):
         try:
             r = requests.get(url, params=params, timeout=15)
             if r.status_code == 200:
-                return r.json()
-            elif r.status_code == 451:
-                last_err = f"地区限制 451 (GitHub IP 被币安屏蔽)"
-                break
-            elif r.status_code == 429:
-                time.sleep(2)
-                last_err = "429 限流"
+                d = r.json()
+                if d.get("code") == "0":
+                    return d.get("data", [])
+                last_err = f"OKX code={d.get('code')} msg={d.get('msg')}"
             else:
-                last_err = f"HTTP {r.status_code}: {r.text[:100]}"
+                last_err = f"HTTP {r.status_code}"
+            time.sleep(0.3)
         except Exception as e:
-            last_err = f"{type(e).__name__}: {str(e)[:100]}"
+            last_err = f"{type(e).__name__}: {str(e)[:80]}"
             time.sleep(1)
     if last_err:
-        print(f"  ⚠️ API失败 {endpoint}: {last_err}")
+        print(f"  ⚠️ {endpoint}: {last_err}")
     return None
 
 
@@ -53,13 +52,37 @@ def init_db():
 
 
 def get_symbols():
-    info = api_get("/fapi/v1/exchangeInfo")
-    if not info:
+    """OKX 永续合约列表，返回 instId 列表如 BTC-USDT-SWAP"""
+    data = okx_get("/api/v5/public/instruments", {"instType": "SWAP"})
+    if not data:
         return []
-    return [s["symbol"] for s in info["symbols"]
-            if s["quoteAsset"] == "USDT"
-            and s["contractType"] == "PERPETUAL"
-            and s["status"] == "TRADING"]
+    return [d["instId"] for d in data
+            if d.get("settleCcy") == "USDT" and d.get("state") == "live"]
+
+
+def get_klines(inst_id, days=180):
+    """OKX K线接口，返回币安格式（兼容老逻辑）"""
+    data = okx_get("/api/v5/market/candles", {
+        "instId": inst_id, "bar": "1D", "limit": str(days)
+    })
+    if not data:
+        return None
+    # OKX 返回顺序：[ts, open, high, low, close, vol, volCcy, volCcyQuote, confirm]
+    # OKX 是新→老顺序，转成老→新（跟币安一致）
+    klines = []
+    for row in reversed(data):
+        # 转成币安 klines 格式（只填我们用到的索引：4=close, 2=high, 3=low, 7=quoteVol）
+        klines.append([
+            int(row[0]),       # 0 ts
+            float(row[1]),     # 1 open
+            float(row[2]),     # 2 high
+            float(row[3]),     # 3 low
+            float(row[4]),     # 4 close
+            float(row[5]),     # 5 vol (合约张数)
+            int(row[0]),       # 6 close_time (占位)
+            float(row[7]),     # 7 quote vol (USDT)
+        ])
+    return klines
 
 
 def analyze(symbol, klines):
@@ -67,8 +90,8 @@ def analyze(symbol, klines):
         return None
     data = [{"close": float(k[4]), "high": float(k[2]),
              "low": float(k[3]), "vol": float(k[7])} for k in klines]
-    coin = symbol.replace("USDT", "")
-    if coin in {"USDC", "USDP", "TUSD", "FDUSD", "BTCDOM", "DEFI", "USDM"}:
+    coin = symbol.replace("-USDT-SWAP", "")
+    if coin in {"USDC", "USDP", "TUSD", "FDUSD"}:
         return None
     recent = data[-7:]
     prior = data[:-7]
@@ -122,21 +145,21 @@ def fmt_usd(v):
 
 
 def scan_pool():
-    print("📊 扫描全市场...")
+    print("📊 扫描 OKX 永续合约...")
     syms = get_symbols()
     print(f"  共 {len(syms)} 个合约")
     if not syms:
         return None
     results = []
     for i, s in enumerate(syms):
-        kl = api_get("/fapi/v1/klines", {"symbol": s, "interval": "1d", "limit": 180})
-        if kl and isinstance(kl, list):
+        kl = get_klines(s, 180)
+        if kl:
             r = analyze(s, kl)
             if r:
                 results.append(r)
         if (i + 1) % 10 == 0:
-            time.sleep(0.5)
-        if (i + 1) % 100 == 0:
+            time.sleep(0.3)
+        if (i + 1) % 50 == 0:
             print(f"  进度 {i+1}/{len(syms)}, 发现{len(results)}")
     results.sort(key=lambda x: x["score"], reverse=True)
     print(f"  ✅ 发现 {len(results)} 个标的")
@@ -148,7 +171,7 @@ def build_report(results):
         return ""
     now = datetime.now(timezone(timedelta(hours=8)))
     lines = [
-        f"🏦 **庄家收筹雷达** 标的池更新",
+        f"🏦 **庄家收筹雷达** [OKX] 标的池更新",
         f"⏰ {now.strftime('%Y-%m-%d %H:%M')} CST",
         f"━━━━━━━━━━━━━━━━━━",
         f"扫描发现 {len(results)} 个标的",
@@ -188,7 +211,7 @@ def send_feishu(text):
     if cur:
         chunks.append(cur)
     title = text.split("\n")[0].replace("**", "").strip()[:60]
-    if "失败" in title or "诊断" in title:
+    if "诊断" in title or "失败" in title:
         color = "orange"
     elif "收筹" in title or "标的池" in title:
         color = "blue"
@@ -280,33 +303,22 @@ def save(conn, results):
 def main():
     mode = sys.argv[1] if len(sys.argv) > 1 else "full"
     now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    print(f"🏦 雷达 {now_str} 模式={mode}")
+    print(f"🏦 雷达 {now_str} 模式={mode} (OKX)")
     print(f"   推送: 飞书={'✓' if FEISHU_WEBHOOK else '✗'} TG={'✓' if TG_BOT_TOKEN else '✗'}")
 
-    # 启动测试：先发一条诊断消息验证推送通道
-    diag = (f"🔧 **雷达启动诊断**\n"
+    diag = (f"🔧 **雷达启动诊断** (OKX 版)\n"
             f"⏰ {now_str}\n"
             f"━━━━━━━━━━━━━\n"
             f"模式: {mode}\n"
-            f"推送通道: 飞书={'✓' if FEISHU_WEBHOOK else '✗'} TG={'✓' if TG_BOT_TOKEN else '✗'}\n"
-            f"开始测试币安 API 连通性...")
+            f"飞书={'✓' if FEISHU_WEBHOOK else '✗'} TG={'✓' if TG_BOT_TOKEN else '✗'}\n"
+            f"开始拉取 OKX 永续合约数据...")
     send(diag)
 
     conn = init_db()
     results = scan_pool()
 
     if results is None:
-        # API 不可达
-        err = (f"⚠️ **币安 API 不可达**\n"
-               f"⏰ {now_str}\n"
-               f"━━━━━━━━━━━━━\n"
-               f"`/fapi/v1/exchangeInfo` 返回空。\n"
-               f"原因：GitHub Actions 服务器 IP 被币安屏蔽（HTTP 451）。\n\n"
-               f"解决方案：\n"
-               f"1. 使用代理（自建 VPS 中转）\n"
-               f"2. 改用 OKX/Bybit 等不限制 GitHub IP 的交易所\n"
-               f"3. 把脚本部署到自己的服务器")
-        send(err)
+        send(f"⚠️ **OKX API 不可达**\n⏰ {now_str}\n请查看 GitHub Actions 日志。")
         conn.close()
         return
 
@@ -315,7 +327,7 @@ def main():
         report = build_report(results)
         send(report)
     else:
-        send(f"📭 **本次扫描未发现收筹标的**\n⏰ {now_str}\n（市场无符合条件的横盘币）")
+        send(f"📭 **本次扫描未发现收筹标的**\n⏰ {now_str}\n（OKX 市场无符合条件的横盘币）")
 
     conn.close()
     print("✅ 完成")
