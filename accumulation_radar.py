@@ -17,17 +17,25 @@ MIN_DATA_DAYS = 50
 
 def api_get(endpoint, params=None):
     url = f"{FAPI}{endpoint}"
-    for _ in range(3):
+    last_err = None
+    for attempt in range(3):
         try:
-            r = requests.get(url, params=params, timeout=10)
+            r = requests.get(url, params=params, timeout=15)
             if r.status_code == 200:
                 return r.json()
+            elif r.status_code == 451:
+                last_err = f"地区限制 451 (GitHub IP 被币安屏蔽)"
+                break
             elif r.status_code == 429:
                 time.sleep(2)
+                last_err = "429 限流"
             else:
-                return None
-        except Exception:
+                last_err = f"HTTP {r.status_code}: {r.text[:100]}"
+        except Exception as e:
+            last_err = f"{type(e).__name__}: {str(e)[:100]}"
             time.sleep(1)
+    if last_err:
+        print(f"  ⚠️ API失败 {endpoint}: {last_err}")
     return None
 
 
@@ -117,6 +125,8 @@ def scan_pool():
     print("📊 扫描全市场...")
     syms = get_symbols()
     print(f"  共 {len(syms)} 个合约")
+    if not syms:
+        return None
     results = []
     for i, s in enumerate(syms):
         kl = api_get("/fapi/v1/klines", {"symbol": s, "interval": "1d", "limit": 180})
@@ -178,7 +188,12 @@ def send_feishu(text):
     if cur:
         chunks.append(cur)
     title = text.split("\n")[0].replace("**", "").strip()[:60]
-    color = "blue" if "收筹" in title or "标的池" in title else "red"
+    if "失败" in title or "诊断" in title:
+        color = "orange"
+    elif "收筹" in title or "标的池" in title:
+        color = "blue"
+    else:
+        color = "red"
     ok = True
     for i, ch in enumerate(chunks):
         t = title if len(chunks) == 1 else f"{title} ({i+1}/{len(chunks)})"
@@ -264,14 +279,44 @@ def save(conn, results):
 
 def main():
     mode = sys.argv[1] if len(sys.argv) > 1 else "full"
-    print(f"🏦 雷达 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 模式={mode}")
+    now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    print(f"🏦 雷达 {now_str} 模式={mode}")
     print(f"   推送: 飞书={'✓' if FEISHU_WEBHOOK else '✗'} TG={'✓' if TG_BOT_TOKEN else '✗'}")
+
+    # 启动测试：先发一条诊断消息验证推送通道
+    diag = (f"🔧 **雷达启动诊断**\n"
+            f"⏰ {now_str}\n"
+            f"━━━━━━━━━━━━━\n"
+            f"模式: {mode}\n"
+            f"推送通道: 飞书={'✓' if FEISHU_WEBHOOK else '✗'} TG={'✓' if TG_BOT_TOKEN else '✗'}\n"
+            f"开始测试币安 API 连通性...")
+    send(diag)
+
     conn = init_db()
     results = scan_pool()
+
+    if results is None:
+        # API 不可达
+        err = (f"⚠️ **币安 API 不可达**\n"
+               f"⏰ {now_str}\n"
+               f"━━━━━━━━━━━━━\n"
+               f"`/fapi/v1/exchangeInfo` 返回空。\n"
+               f"原因：GitHub Actions 服务器 IP 被币安屏蔽（HTTP 451）。\n\n"
+               f"解决方案：\n"
+               f"1. 使用代理（自建 VPS 中转）\n"
+               f"2. 改用 OKX/Bybit 等不限制 GitHub IP 的交易所\n"
+               f"3. 把脚本部署到自己的服务器")
+        send(err)
+        conn.close()
+        return
+
     if results:
         save(conn, results)
         report = build_report(results)
         send(report)
+    else:
+        send(f"📭 **本次扫描未发现收筹标的**\n⏰ {now_str}\n（市场无符合条件的横盘币）")
+
     conn.close()
     print("✅ 完成")
 
