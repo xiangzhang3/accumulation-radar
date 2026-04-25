@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""庄家收筹雷达 — OKX 数据源版本"""
+"""庄家收筹雷达 — OKX 数据源 + TG 优先推送"""
 import os, sys, time, sqlite3, requests
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -52,7 +52,6 @@ def init_db():
 
 
 def get_symbols():
-    """OKX 永续合约列表，返回 instId 列表如 BTC-USDT-SWAP"""
     data = okx_get("/api/v5/public/instruments", {"instType": "SWAP"})
     if not data:
         return []
@@ -61,26 +60,16 @@ def get_symbols():
 
 
 def get_klines(inst_id, days=180):
-    """OKX K线接口，返回币安格式（兼容老逻辑）"""
     data = okx_get("/api/v5/market/candles", {
         "instId": inst_id, "bar": "1D", "limit": str(days)
     })
     if not data:
         return None
-    # OKX 返回顺序：[ts, open, high, low, close, vol, volCcy, volCcyQuote, confirm]
-    # OKX 是新→老顺序，转成老→新（跟币安一致）
     klines = []
     for row in reversed(data):
-        # 转成币安 klines 格式（只填我们用到的索引：4=close, 2=high, 3=low, 7=quoteVol）
         klines.append([
-            int(row[0]),       # 0 ts
-            float(row[1]),     # 1 open
-            float(row[2]),     # 2 high
-            float(row[3]),     # 3 low
-            float(row[4]),     # 4 close
-            float(row[5]),     # 5 vol (合约张数)
-            int(row[0]),       # 6 close_time (占位)
-            float(row[7]),     # 7 quote vol (USDT)
+            int(row[0]), float(row[1]), float(row[2]), float(row[3]),
+            float(row[4]), float(row[5]), int(row[0]), float(row[7]),
         ])
     return klines
 
@@ -171,7 +160,7 @@ def build_report(results):
         return ""
     now = datetime.now(timezone(timedelta(hours=8)))
     lines = [
-        f"🏦 **庄家收筹雷达** [OKX] 标的池更新",
+        f"🏦 *庄家收筹雷达* [OKX] 标的池更新",
         f"⏰ {now.strftime('%Y-%m-%d %H:%M')} CST",
         f"━━━━━━━━━━━━━━━━━━",
         f"扫描发现 {len(results)} 个标的",
@@ -181,23 +170,66 @@ def build_report(results):
     warm = [r for r in results if "开始放量" in r["status"]]
     sleep_ = [r for r in results if "收筹中" in r["status"]]
     if fire:
-        lines.append(f"🔥 **放量启动** ({len(fire)})")
+        lines.append(f"🔥 *放量启动* ({len(fire)})")
         for r in fire[:10]:
-            lines.append(f"  🔥 **{r['coin']}** 分:{r['score']:.0f} 横盘{r['sideways_days']}天 波动{r['range_pct']:.0f}% Vol{r['vol_breakout']:.1f}x")
+            lines.append(f"  🔥 *{r['coin']}* 分:{r['score']:.0f} 横盘{r['sideways_days']}天 波动{r['range_pct']:.0f}% Vol{r['vol_breakout']:.1f}x")
         lines.append("")
     if warm:
-        lines.append(f"⚡ **开始放量** ({len(warm)})")
+        lines.append(f"⚡ *开始放量* ({len(warm)})")
         for r in warm[:10]:
             lines.append(f"  ⚡ {r['coin']} 分:{r['score']:.0f} 横盘{r['sideways_days']}天 Vol{r['vol_breakout']:.1f}x")
         lines.append("")
     if sleep_:
-        lines.append(f"💤 **收筹中** ({len(sleep_)})")
+        lines.append(f"💤 *收筹中* ({len(sleep_)})")
         for r in sleep_[:15]:
             lines.append(f"  💤 {r['coin']} 分:{r['score']:.0f} 横盘{r['sideways_days']}天 日均{fmt_usd(r['avg_vol'])}")
     return "\n".join(lines)
 
 
+def send_telegram(text):
+    if not TG_BOT_TOKEN or not TG_CHAT_ID:
+        print("[TG] 未配置，跳过")
+        return False
+    url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
+    chunks = []
+    cur = ""
+    for line in text.split("\n"):
+        if len(cur) + len(line) + 1 > 3800:
+            chunks.append(cur)
+            cur = line
+        else:
+            cur += "\n" + line if cur else line
+    if cur:
+        chunks.append(cur)
+    sent_any = False
+    for i, ch in enumerate(chunks):
+        try:
+            r = requests.post(url, json={
+                "chat_id": TG_CHAT_ID, "text": ch,
+                "parse_mode": "Markdown"
+            }, timeout=10)
+            if r.status_code == 200:
+                print(f"[TG] Sent ✓ ({len(ch)} chars)")
+                sent_any = True
+            else:
+                # Markdown 失败，降级为纯文本
+                plain = ch.replace("*", "").replace("_", "").replace("`", "")
+                r2 = requests.post(url, json={
+                    "chat_id": TG_CHAT_ID, "text": plain
+                }, timeout=10)
+                if r2.status_code == 200:
+                    print(f"[TG] Sent plain ✓")
+                    sent_any = True
+                else:
+                    print(f"[TG] Failed: {r2.status_code} {r2.text[:200]}")
+        except Exception as e:
+            print(f"[TG] Error: {type(e).__name__}: {e}")
+        time.sleep(0.5)
+    return sent_any
+
+
 def send_feishu(text):
+    """飞书备用通道（如果 webhook 配置了且可用）"""
     if not FEISHU_WEBHOOK:
         return False
     chunks = []
@@ -210,77 +242,43 @@ def send_feishu(text):
             cur += "\n" + line if cur else line
     if cur:
         chunks.append(cur)
-    title = text.split("\n")[0].replace("**", "").strip()[:60]
-    if "诊断" in title or "失败" in title:
-        color = "orange"
-    elif "收筹" in title or "标的池" in title:
-        color = "blue"
-    else:
-        color = "red"
-    ok = True
+    title = text.split("\n")[0].replace("*", "").strip()[:60]
+    color = "blue" if "收筹" in title or "标的池" in title else "red"
+    sent_any = False
     for i, ch in enumerate(chunks):
         t = title if len(chunks) == 1 else f"{title} ({i+1}/{len(chunks)})"
-        payload = {
-            "msg_type": "interactive",
-            "card": {
-                "config": {"wide_screen_mode": True},
-                "header": {"template": color, "title": {"tag": "plain_text", "content": t}},
-                "elements": [{"tag": "div", "text": {"tag": "lark_md", "content": ch}}]
-            }
-        }
         try:
-            r = requests.post(FEISHU_WEBHOOK, json=payload, timeout=10)
+            r = requests.post(FEISHU_WEBHOOK, json={
+                "msg_type": "interactive",
+                "card": {
+                    "config": {"wide_screen_mode": True},
+                    "header": {"template": color, "title": {"tag": "plain_text", "content": t}},
+                    "elements": [{"tag": "div", "text": {"tag": "lark_md", "content": ch}}]
+                }
+            }, timeout=10)
             d = r.json() if r.text else {}
             if r.status_code == 200 and d.get("code", 0) == 0:
-                print(f"[飞书] Sent ✓ ({len(ch)} chars)")
+                print(f"[飞书] Sent ✓")
+                sent_any = True
             else:
-                r2 = requests.post(FEISHU_WEBHOOK, json={
-                    "msg_type": "text",
-                    "content": {"text": ch.replace("**", "")}
-                }, timeout=10)
-                d2 = r2.json() if r2.text else {}
-                if d2.get("code", 0) == 0:
-                    print("[飞书] Sent plain ✓")
-                else:
-                    print(f"[飞书] Failed: {d}")
-                    ok = False
+                print(f"[飞书] Failed: {d}")
         except Exception as e:
             print(f"[飞书] Error: {e}")
-            ok = False
-        time.sleep(0.5)
-    return ok
-
-
-def send_telegram(text):
-    if not TG_BOT_TOKEN:
-        return False
-    url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
-    try:
-        r = requests.post(url, json={
-            "chat_id": TG_CHAT_ID, "text": text[:3800],
-            "parse_mode": "Markdown"
-        }, timeout=10)
-        if r.status_code == 200:
-            print("[TG] Sent ✓")
-            return True
-        r2 = requests.post(url, json={
-            "chat_id": TG_CHAT_ID,
-            "text": text.replace("*", "").replace("_", "")[:3800]
-        }, timeout=10)
-        return r2.status_code == 200
-    except Exception as e:
-        print(f"[TG] Error: {e}")
-        return False
+        time.sleep(0.3)
+    return sent_any
 
 
 def send(text):
+    """TG 优先，飞书备用"""
     if not text:
         return
     sent = False
-    if FEISHU_WEBHOOK:
-        sent = send_feishu(text)
-    if not sent and TG_BOT_TOKEN:
+    # TG 优先
+    if TG_BOT_TOKEN:
         sent = send_telegram(text)
+    # TG 没成功才用飞书
+    if not sent and FEISHU_WEBHOOK:
+        sent = send_feishu(text)
     if not sent:
         print("\n[NO PUSH]\n" + text)
 
@@ -304,13 +302,13 @@ def main():
     mode = sys.argv[1] if len(sys.argv) > 1 else "full"
     now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     print(f"🏦 雷达 {now_str} 模式={mode} (OKX)")
-    print(f"   推送: 飞书={'✓' if FEISHU_WEBHOOK else '✗'} TG={'✓' if TG_BOT_TOKEN else '✗'}")
+    print(f"   推送: TG={'✓' if TG_BOT_TOKEN else '✗'} 飞书={'✓' if FEISHU_WEBHOOK else '✗'}")
 
-    diag = (f"🔧 **雷达启动诊断** (OKX 版)\n"
+    diag = (f"🔧 *雷达启动诊断* (OKX)\n"
             f"⏰ {now_str}\n"
             f"━━━━━━━━━━━━━\n"
             f"模式: {mode}\n"
-            f"飞书={'✓' if FEISHU_WEBHOOK else '✗'} TG={'✓' if TG_BOT_TOKEN else '✗'}\n"
+            f"TG={'✓' if TG_BOT_TOKEN else '✗'} 飞书={'✓' if FEISHU_WEBHOOK else '✗'}\n"
             f"开始拉取 OKX 永续合约数据...")
     send(diag)
 
@@ -318,7 +316,7 @@ def main():
     results = scan_pool()
 
     if results is None:
-        send(f"⚠️ **OKX API 不可达**\n⏰ {now_str}\n请查看 GitHub Actions 日志。")
+        send(f"⚠️ *OKX API 不可达*\n⏰ {now_str}\n请查看 GitHub Actions 日志。")
         conn.close()
         return
 
@@ -327,7 +325,7 @@ def main():
         report = build_report(results)
         send(report)
     else:
-        send(f"📭 **本次扫描未发现收筹标的**\n⏰ {now_str}\n（OKX 市场无符合条件的横盘币）")
+        send(f"📭 *本次扫描未发现收筹标的*\n⏰ {now_str}")
 
     conn.close()
     print("✅ 完成")
